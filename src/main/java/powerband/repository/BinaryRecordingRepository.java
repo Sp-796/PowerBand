@@ -15,6 +15,7 @@ import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.text.Normalizer;
 import java.util.Locale;
 import java.util.concurrent.locks.ReentrantLock;
@@ -143,7 +144,7 @@ public final class BinaryRecordingRepository implements SongRepository {
                 throw new StorageException("Could not create index directory", exception);
             }
 
-            long originalLength = 0;
+            long originalLength = -1;
             RandomAccessFile index = null;
             try {
                 index = new RandomAccessFile(Constants.INDEX_FILE.toFile(), "rw");
@@ -169,7 +170,7 @@ public final class BinaryRecordingRepository implements SongRepository {
     }
 
     private void sortIndex() {
-        StorageException failure = null;
+        boolean backupCreated = false;
         try {
             long fileLength;
             try (RandomAccessFile index = new RandomAccessFile(Constants.INDEX_FILE.toFile(), "r")) {
@@ -182,99 +183,93 @@ public final class BinaryRecordingRepository implements SongRepository {
             if (recordCount > 1) {
                 createParentDirectories(Constants.INDEX_TEMP_A);
                 createParentDirectories(Constants.INDEX_TEMP_B);
+                Files.copy(Constants.INDEX_FILE, Constants.INDEX_TEMP_A,
+                        StandardCopyOption.REPLACE_EXISTING);
+                backupCreated = true;
                 long runLength = 1;
                 while (runLength < recordCount) {
-                    distributeRuns(runLength, recordCount);
                     mergeRuns(runLength, recordCount);
                     runLength = runLength > recordCount / 2 ? recordCount : runLength * 2;
                 }
+                Files.deleteIfExists(Constants.INDEX_TEMP_B);
+                Files.delete(Constants.INDEX_TEMP_A);
             }
         } catch (IOException exception) {
-            failure = new StorageException("Could not sort recording index on disk", exception);
+            throw recoverIndexAfterSortFailure(exception, backupCreated);
         } catch (StorageException exception) {
-            failure = exception;
-        } finally {
-            try {
-                Files.deleteIfExists(Constants.INDEX_TEMP_A);
-                Files.deleteIfExists(Constants.INDEX_TEMP_B);
-            } catch (IOException exception) {
-                if (failure == null) {
-                    failure = new StorageException("Could not remove index sort files", exception);
-                } else {
-                    failure.addSuppressed(exception);
-                }
-            }
-        }
-        if (failure != null) {
-            throw failure;
-        }
-    }
-
-    private void distributeRuns(long runLength, long recordCount) throws IOException {
-        try (RandomAccessFile source = new RandomAccessFile(Constants.INDEX_FILE.toFile(), "r");
-             RandomAccessFile first = new RandomAccessFile(Constants.INDEX_TEMP_A.toFile(), "rw");
-             RandomAccessFile second = new RandomAccessFile(Constants.INDEX_TEMP_B.toFile(), "rw")) {
-            first.setLength(0);
-            second.setLength(0);
-            for (long position = 0; position < recordCount; position++) {
-                source.seek(position * Constants.INDEX_RECORD_BYTES);
-                RecordingIndexEntry entry = readIndexEntry(source);
-                long runNumber = position / runLength;
-                RandomAccessFile target = runNumber % 2 == 0 ? first : second;
-                writeIndexEntry(target, entry);
-            }
+            throw recoverIndexAfterSortFailure(exception, backupCreated);
         }
     }
 
     private void mergeRuns(long runLength, long recordCount) throws IOException {
-        try (RandomAccessFile first = new RandomAccessFile(Constants.INDEX_TEMP_A.toFile(), "r");
-             RandomAccessFile second = new RandomAccessFile(Constants.INDEX_TEMP_B.toFile(), "r");
-             RandomAccessFile target = new RandomAccessFile(Constants.INDEX_FILE.toFile(), "rw")) {
+        try (RandomAccessFile source = new RandomAccessFile(Constants.INDEX_FILE.toFile(), "r");
+             RandomAccessFile target = new RandomAccessFile(Constants.INDEX_TEMP_B.toFile(), "rw")) {
             target.setLength(0);
-            long firstPosition = 0;
-            long secondPosition = 0;
-            long runsRemaining = recordCount;
+            long position = 0;
+            while (position < recordCount) {
+                long middle = Math.min(position + runLength, recordCount);
+                long end = Math.min(middle + runLength, recordCount);
+                long leftPosition = position;
+                long rightPosition = middle;
+                RecordingIndexEntry left = leftPosition < middle
+                        ? readIndexEntryAt(source, leftPosition++) : null;
+                RecordingIndexEntry right = rightPosition < end
+                        ? readIndexEntryAt(source, rightPosition++) : null;
 
-            while (runsRemaining > 0) {
-                long leftCount = Math.min(runLength, runsRemaining);
-                runsRemaining -= leftCount;
-                long rightCount = Math.min(runLength, runsRemaining);
-                runsRemaining -= rightCount;
-                long leftRemaining = leftCount;
-                long rightRemaining = rightCount;
-                long leftRead = 0;
-                long rightRead = 0;
-                RecordingIndexEntry left = leftRemaining > 0
-                        ? readIndexEntryAt(first, firstPosition + leftRead++) : null;
-                RecordingIndexEntry right = rightRemaining > 0
-                        ? readIndexEntryAt(second, secondPosition + rightRead++) : null;
-
-                while (leftRemaining > 0 || rightRemaining > 0) {
-                    if (leftRemaining == 0) {
+                while (left != null || right != null) {
+                    if (left == null) {
                         writeIndexEntry(target, right);
-                        rightRemaining--;
-                        right = rightRemaining > 0
-                                ? readIndexEntryAt(second, secondPosition + rightRead++) : null;
-                    } else if (rightRemaining == 0) {
+                        right = rightPosition < end
+                                ? readIndexEntryAt(source, rightPosition++) : null;
+                    } else if (right == null) {
                         writeIndexEntry(target, left);
-                        leftRemaining--;
-                        left = leftRemaining > 0
-                                ? readIndexEntryAt(first, firstPosition + leftRead++) : null;
+                        left = leftPosition < middle
+                                ? readIndexEntryAt(source, leftPosition++) : null;
                     } else if (compareEntries(left, right) <= 0) {
                         writeIndexEntry(target, left);
-                        leftRemaining--;
-                        left = leftRemaining > 0
-                                ? readIndexEntryAt(first, firstPosition + leftRead++) : null;
+                        left = leftPosition < middle
+                                ? readIndexEntryAt(source, leftPosition++) : null;
                     } else {
                         writeIndexEntry(target, right);
-                        rightRemaining--;
-                        right = rightRemaining > 0
-                                ? readIndexEntryAt(second, secondPosition + rightRead++) : null;
+                        right = rightPosition < end
+                                ? readIndexEntryAt(source, rightPosition++) : null;
                     }
                 }
-                firstPosition += leftCount;
-                secondPosition += rightCount;
+                position = end;
             }
+        }
+
+        try (RandomAccessFile source = new RandomAccessFile(Constants.INDEX_TEMP_B.toFile(), "r");
+             RandomAccessFile target = new RandomAccessFile(Constants.INDEX_FILE.toFile(), "rw")) {
+            target.setLength(0);
+            for (long position = 0; position < recordCount; position++) {
+                writeIndexEntry(target, readIndexEntry(source));
+            }
+        }
+    }
+
+    private static StorageException recoverIndexAfterSortFailure(Throwable failure, boolean backupCreated) {
+        StorageException sortFailure = failure instanceof StorageException
+                ? (StorageException) failure
+                : new StorageException("Could not sort recording index on disk", failure);
+        if (backupCreated) {
+            try {
+                Files.copy(Constants.INDEX_TEMP_A, Constants.INDEX_FILE,
+                        StandardCopyOption.REPLACE_EXISTING);
+            } catch (IOException restoreException) {
+                sortFailure.addSuppressed(restoreException);
+            }
+        }
+        deleteSortFile(Constants.INDEX_TEMP_B, sortFailure);
+        deleteSortFile(Constants.INDEX_TEMP_A, sortFailure);
+        return sortFailure;
+    }
+
+    private static void deleteSortFile(Path path, StorageException failure) {
+        try {
+            Files.deleteIfExists(path);
+        } catch (IOException exception) {
+            failure.addSuppressed(exception);
         }
     }
 
@@ -463,6 +458,9 @@ public final class BinaryRecordingRepository implements SongRepository {
     }
 
     private static void rollbackIndex(RandomAccessFile index, long originalLength, Throwable failure) {
+        if (originalLength < 0) {
+            return;
+        }
         if (index != null) {
             try {
                 index.setLength(originalLength);
@@ -471,6 +469,12 @@ public final class BinaryRecordingRepository implements SongRepository {
             }
             try {
                 index.close();
+            } catch (IOException rollbackException) {
+                failure.addSuppressed(rollbackException);
+            }
+        } else {
+            try (RandomAccessFile rollback = new RandomAccessFile(Constants.INDEX_FILE.toFile(), "rw")) {
+                rollback.setLength(originalLength);
             } catch (IOException rollbackException) {
                 failure.addSuppressed(rollbackException);
             }

@@ -53,9 +53,11 @@ public final class MusicEditorService implements AutoCloseable {
     }
 
     public synchronized CompletableFuture<Void> play(String songName, Instrument instrument) {
-        ensureOpen();
+        if (closed) {
+            throw new PlaybackException("Music editor service is closed");
+        }
         if (instrument == null) {
-            throw new IllegalArgumentException("Playback instrument is required");
+            throw new PlaybackException("Playback instrument is required");
         }
         if (playbackState != null && !playbackState.completion.isDone()) {
             throw new PlaybackException("A song is already playing");
@@ -118,7 +120,7 @@ public final class MusicEditorService implements AutoCloseable {
 
     private synchronized void ensureOpen() {
         if (closed) {
-            throw new IllegalStateException("Music editor service is closed");
+            throw new PlaybackException("Music editor service is closed");
         }
     }
 
